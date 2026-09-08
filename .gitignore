@@ -1,0 +1,11 @@
+bench.env
+.env
+jobs/
+
+# Python bytecode from harbor importing drip_agent
+__pycache__/
+
+# drip home files left behind by running drip in this directory; the benchmark
+# uses bench_config.json, not these.
+/config.json
+/env.vars
