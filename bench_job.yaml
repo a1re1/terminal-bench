@@ -1,0 +1,31 @@
+# Job config for the drip benchmark. Run with:
+#   PYTHONPATH="$PWD" harbor run -c bench_job.yaml [--env docker] [-n 15]
+#
+# This exists instead of a plain `--agent drip_agent:DripAgent` because that
+# flag collapses the agent's display name and its import path into one field,
+# so the jobs list shows "drip_agent:DripAgent" and records no model. Splitting
+# name from import_path (harbor.models.trial.config:AgentConfig) gives a clean
+# label and fills the provider/model columns at the job level, not just per
+# trial. run_sweep.sh passes this file.
+agents:
+  - name: drip
+    import_path: drip_agent:DripAgent
+    # Every model a role can reach. Harbor splits on the first "/" only, so the
+    # leading segment is the provider and the rest is the model label; this
+    # must stay in sync with DripAgent._config_model_name(), which derives the
+    # same string from bench_config.json for the per-trial record.
+    model_name: openrouter/z-ai/glm-5.3-flash+openai/gpt-6-astra
+
+datasets:
+  - name: terminal-bench/terminal-bench
+    ref: 4.0.0
+    # Tasks declaring `gpus = 1`. Harbor validates GPU support while building
+    # the environment, and the RuntimeError it raises kills the whole job — so
+    # on a GPU-less backend they must be excluded rather than left to fail.
+    # Matching is fnmatch against the org-prefixed name; a bare task name
+    # silently matches nothing. run_sweep.sh strips this list for GPU-capable
+    # backends so they run there; see RUNNING.md.
+    exclude_task_names:
+      - terminal-bench/fp8-rmsnorm-gemm
+      - terminal-bench/jax-speedrun-gpu
+      - terminal-bench/math-eval-grader
