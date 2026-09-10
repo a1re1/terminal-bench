@@ -14,14 +14,11 @@ DRIP_SRC="${DRIP_SRC:-$HOME/src/drip}"
 # x86_64. drip_agent.py probes `uname -m` and picks the same way — this only
 # decides which binary preflight insists on.
 HARBOR_ENV="${HARBOR_ENV:-docker}"
-if [[ "$HARBOR_ENV" == "docker" ]]; then
-  case "$(uname -m)" in
-    arm64|aarch64) TRIPLE="aarch64-unknown-linux-musl" ;;
-    *)             TRIPLE="x86_64-unknown-linux-musl" ;;
-  esac
-else
-  TRIPLE="x86_64-unknown-linux-musl"
-fi
+# terminal-bench ships prebuilt amd64 task images, so containers report x86_64
+# even on an Apple Silicon host (Rosetta/qemu translates them) — the host's own
+# arch is irrelevant here. Keep the aarch64 build around for the day the images
+# go multi-arch; drip_agent.py probes `uname -m` and will pick it up on its own.
+TRIPLE="x86_64-unknown-linux-musl"
 BINARY="$DRIP_SRC/target/$TRIPLE/release/drip"
 # Local runs are bounded by this machine, not by a billing account.
 if [[ "$HARBOR_ENV" == "docker" ]]; then
@@ -32,7 +29,21 @@ fi
 # Harbor's per-task agent timeout has been observed not to fire (a trial ran
 # 13h22m against an 8h limit), so cap the whole job from outside.
 WALL_CLOCK="${WALL_CLOCK:-14h}"
-DATASET="terminal-bench/terminal-bench@4.0.0"
+
+# bench_job.yaml carries the agent's display name, import path, and model
+# label. It also holds the GPU-task exclusions, because a CLI -x replaces the
+# whole dataset block and silently drops `agents` — the two cannot be combined.
+# A GPU-capable backend gets a temp copy with the exclusions stripped, so
+# bench_job.yaml stays the single source of truth.
+JOB_CONFIG="bench_job.yaml"
+STRIP_EXCLUDES="$(dirname "$0")/.strip_excludes.py"
+if [[ "$HARBOR_ENV" != "docker" ]]; then
+  JOB_CONFIG="$(mktemp -t bench_job).yaml"
+  if ! ~/.local/share/uv/tools/harbor/bin/python "$STRIP_EXCLUDES" bench_job.yaml "$JOB_CONFIG"; then
+    echo "  FAIL  could not build the GPU-capable job config" >&2
+    exit 1
+  fi
+fi
 
 fail() { printf '  FAIL  %s\n' "$1" >&2; FAILED=1; }
 ok()   { printf '  ok    %s\n' "$1"; }
@@ -93,7 +104,7 @@ echo "Preflight passed."
 [[ "${1:-}" == "--dry-run" ]] && { echo "(dry run — stopping here)"; exit 0; }
 
 echo
-echo "Launching: 66 tasks on ${HARBOR_ENV}, ${N_CONCURRENT} concurrent, hard cap ${WALL_CLOCK}"
+echo "Launching on ${HARBOR_ENV} from ${JOB_CONFIG}, ${N_CONCURRENT} concurrent, hard cap ${WALL_CLOCK}"
 
 # Killing harbor does not stop Modal sandboxes; they keep billing. Two sweeps
 # have been abandoned with dozens of containers still running, so stop them on
@@ -129,8 +140,7 @@ on_signal() {
 trap on_signal INT TERM
 
 timeout "$WALL_CLOCK" env PYTHONPATH="$PWD" harbor run \
-  -d "$DATASET" \
-  --agent drip_agent:DripAgent \
+  -c "$JOB_CONFIG" \
   --env "$HARBOR_ENV" \
   --n-concurrent "$N_CONCURRENT" \
   --env-file bench.env &

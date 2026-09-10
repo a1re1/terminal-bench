@@ -42,10 +42,19 @@ while OpenRouter spend was only ~$22. Tokens were never the expensive part.
 
 |                | local docker            | modal                    |
 | -------------- | ----------------------- | ------------------------ |
-| arch           | host arch (arm64 here)  | always x86_64            |
+| arch           | x86_64 (emulated)       | always x86_64            |
 | GPU tasks      | **cannot run**          | yes, with billing on     |
-| concurrency    | 4 default (14 cpu host) | 20 default               |
+| concurrency    | 4 default; 15 is safe   | 20 default               |
 | cost           | electricity             | per container-hour       |
+
+Local containers are **x86_64 even on Apple Silicon**: harbor pulls prebuilt
+pinned `harborframework/terminal-bench:*` images, which are amd64 only, so
+everything runs under Rosetta translation. The host's own arch does not enter
+into it — `drip_agent.py` probes `uname -m` inside the container and picks the
+musl target from that, so only the `x86_64-unknown-linux-musl` build is actually
+used today. Expect setup steps (a 13 MB binary upload) to be several times slower
+than native, which is what makes the agent-setup timeout the first thing to blow
+under concurrency.
 
 ### Architecture
 
@@ -104,9 +113,96 @@ already partially uploaded, it "fills in the missing trials and finalizes." So
 uploading before the GPU half lands is safe — resume and re-upload completes the
 same job rather than creating a second one.
 
-> **Untested.** The config-flip mid-job has not been exercised; resume may
-> validate the environment against the per-trial locks. Prove it on a 2-task job
-> before relying on it for a real sweep.
+> **The config flip needs a second edit.** Confirmed on 2026-09-08: resume
+> rebuilds a `TrialConfig` for every task and requires it to be **exactly equal**
+> to the `config.json` of each trial that still has a `result.json`
+> (`harbor/job.py:348`). Any job-level change — `environment`, a timeout
+> multiplier — makes the plan differ from what the surviving trials recorded, and
+> resume aborts before starting anything:
+>
+> ```
+> ValueError: Existing trial config does not match planned job config.
+> ```
+>
+> So step 2 must write the same field into every surviving trial's
+> `jobs/<JOB_DIR>/<trial>/config.json` as well, not just the job config. Trials
+> that resume is about to delete (`-f`) don't matter; only the ones it keeps.
+> `n_concurrent_trials` is the exception — it lives on the job and in
+> `lock.json`, not in the trial configs (see below).
+
+---
+
+## Sizing a local sweep, and what actually breaks
+
+Every failure below was hit on 2026-09-08. Read this before raising concurrency.
+
+**Concurrency is bounded by host RAM, not by the VM or by task declarations.**
+A 63-concurrent sweep was killed by macOS for memory pressure. Measuring the
+live containers showed why the obvious diagnosis was wrong:
+
+```
+31 containers: 7.9 GB in use / 410 GB of caps granted   → 2% utilization
+VM at that moment: 42 of 46 GB free
+```
+
+Task-declared `memory_mb` is close to meaningless — several tasks declare 16 GB
+and use a few hundred MB, so container caps never bind. What binds is that
+colima with `--vm-type vz` reserves its whole allocation from the host up front,
+and harbor spawns **one host-side `docker compose` process per concurrent
+trial**. A 48 GB VM on a 64 GB Mac left ~16 GB for macOS, the editor, harbor and
+63 compose processes; macOS killed the largest tree, which was harbor. The VM is
+now 32 GB (`~/.colima/default/colima.yaml`), which cost nothing and doubled the
+host reserve. **15 concurrent is the tested ceiling here.**
+
+Watch host free memory, not `docker stats`, when judging headroom.
+
+**Raise the setup timeout whenever you raise concurrency.** The agent-setup
+budget is 360s (`harbor/trial/trial.py:93`) and it bounds the binary upload,
+which is slow under Rosetta. At 63 concurrent, 31 trials died on it. Both knobs
+are job-level and take effect on resume:
+
+```jsonc
+"n_concurrent_trials": 15,
+"agent_setup_timeout_multiplier": 5.0,      // 360s -> 1800s
+"environment_build_timeout_multiplier": 3.0  // env start, per-task base
+```
+
+**`n_concurrent_trials` also lives in `lock.json`,** and a mismatch against the
+resolved lock is a hard `FileExistsError` (`harbor/job.py:909`). Move the
+job-level `lock.json` aside before resuming with a different concurrency.
+
+**Docker's default address pool runs out at 31 networks.** Symptom: `all
+predefined address pools have been fully subnetted`. Fixed in
+`~/.colima/default/colima.yaml`, giving 256:
+
+```yaml
+docker:
+  default-address-pools:
+    - base: 10.200.0.0/16
+      size: 24
+```
+
+**A killed run leaves debris that looks like a real failure.** In-flight trials
+record `RuntimeError: There is no current event loop in thread 'MainThread'`.
+That shares its type with genuine `RuntimeError`s — notably
+`live-database-cutover`, which declares `cpus = 16` against a 12-CPU VM on a
+14-core host and so can never run locally at any concurrency. `-f RuntimeError`
+cannot tell them apart. Match on the message and delete just the debris dirs;
+any trial dir without a `result.json` is re-run (`harbor/job.py:265`).
+
+**Two settings that must be right before a sweep, both silent when wrong:**
+
+- `credsStore` in `~/.docker/config.json` — a leftover `"desktop"` from a removed
+  Docker Desktop makes every image pull fail with
+  `docker-credential-desktop: executable file not found`, failing 100% of trials.
+- `exclude_task_names` matching is `fnmatch` against the **org-prefixed** name
+  (`harbor/models/job/config.py:147`), so a bare `math-eval-grader` silently
+  matches nothing. Always write `terminal-bench/math-eval-grader`.
+
+**A CLI dataset flag replaces the whole dataset block** and nulls out `agents`,
+so `-c bench_job.yaml` cannot be combined with `-x` or `-i`. Check any
+combination with `--print-config` before trusting it; this is why the GPU
+exclusions live in the YAML and `.strip_excludes.py` exists.
 
 ---
 

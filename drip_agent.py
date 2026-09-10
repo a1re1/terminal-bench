@@ -165,10 +165,25 @@ class DripAgent(BaseInstalledAgent):
             remote_path=REMOTE_CONFIG,
             filename="config.json",
         )
-        # _upload_config_text chmods 600 and chowns to the agent user; the
-        # directory itself still has to be traversable by that user.
+        # _upload_config_text chmods 600 and chowns the file to the agent user,
+        # but root still owns the directory. drip writes under $DRIP_HOME at
+        # runtime — the session index at projects/<slug>/sessions/ — so 755 on a
+        # root-owned home makes it traversable and still unwritable, and drip
+        # panics: "create index parent dirs: PermissionDenied"
+        # (core/sessions.rs:123).
+        #
+        # default_user is None whenever the image declares no USER, i.e. the
+        # agent already runs as root and owns REMOTE_HOME. Interpolating that
+        # None into the command yields `chown None`, which exits 1 and fails
+        # install on every root image — the common case — so only the handful of
+        # images with a real USER get the chown. _upload_skills guards the same
+        # way.
+        chown = ""
+        if environment.default_user is not None:
+            chown = f"chown {shlex.quote(str(environment.default_user))} {shlex.quote(REMOTE_HOME)} && "
         await self.exec_as_root(
-            environment, command=f"chmod 755 {shlex.quote(REMOTE_HOME)}"
+            environment,
+            command=f"{chown}chmod 755 {shlex.quote(REMOTE_HOME)}",
         )
 
         await self._upload_skills(environment)
@@ -195,20 +210,42 @@ class DripAgent(BaseInstalledAgent):
 
     @classmethod
     def _config_model_name(cls) -> str | None:
-        """`provider/model` for the base profile, for harbor's model column.
+        """`provider/modelA+modelB` for harbor's model column.
 
-        drip routes per role, so no single name is the whole truth; the base
-        profile is the one every unrouted call uses and dominates the volume.
-        harbor splits this on the first "/" to derive the provider
-        (agents/base.py:154-155). Per-role detail goes in context.metadata.
+        drip routes per role, so naming only the base profile hides the
+        planner — which is a small fraction of calls but a large fraction of
+        spend, and the whole point of the routing. Every model that a role can
+        reach is named here, joined by "+", with the base profile first.
+
+        harbor splits this on the first "/" only (agents/base.py:154-155), so
+        the leading segment is the provider and everything after it is the
+        model label. Exact per-model counts stay in context.metadata.
         """
         try:
             config = json.loads(cls._sanitized_config())
             settings = config["settings"]
+            profiles = {
+                p["id"]: p for p in json.loads(settings["runtime.model_profiles"])
+            }
             active = settings.get("runtime.active_profile_id")
-            for profile in json.loads(settings["runtime.model_profiles"]):
-                if profile.get("id") == active:
-                    return f"{profile['provider']}/{profile['model']}"
+
+            reachable = [active] if active in profiles else []
+            for role in json.loads(settings.get("runtime.role_profiles", "[]")):
+                pid = role.get("model")
+                if pid in profiles and pid not in reachable:
+                    reachable.append(pid)
+            if not reachable:
+                return None
+
+            providers = {profiles[p]["provider"] for p in reachable}
+            if len(providers) != 1:
+                # A mixed-provider run has no single provider to report; fall
+                # back to the base profile rather than mislabel the column.
+                base = profiles.get(active)
+                return f"{base['provider']}/{base['model']}" if base else None
+
+            names = "+".join(profiles[p]["model"] for p in reachable)
+            return f"{providers.pop()}/{names}"
         except Exception:
             return None
         return None
